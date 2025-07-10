@@ -8,6 +8,8 @@ import os
 from datetime import timedelta
 import holidays
 
+st.title("Sales Forecast by SKU")
+
 # Set up folder containing SKU Excel files
 DATA_FOLDER = "data"  # <-- Make sure your Excel files are inside a "data" folder in your working directory
 
@@ -48,7 +50,6 @@ df_copy = df_copy.rename(columns={'date': 'ds', 'sales': 'y'})
 
 
 # Forecast UI
-st.title("Sales Forecast by SKU")
 months = st.selectbox("Select forecast horizon (months):", options=[1, 2, 3], index=0)
 monthly_marketing = st.slider("Monthly Marketing Spend", min_value=0, max_value=10000000, value=100000, step=100000)
 selling_price = st.slider("Selling Price (SP)", min_value=0, max_value=4499, value=3499, step=50)
