@@ -1,1 +1,6 @@
-prophet\npandas\nmatplotlib\nstreamlit\nholidays\nopenpyxl
+prophet
+pandas
+matplotlib
+streamlit
+holidays
+openpyxl
