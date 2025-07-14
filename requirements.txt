@@ -5,3 +5,5 @@ streamlit
 holidays
 openpyxl
 plotly
+sqlalchemy
+psycopg2
