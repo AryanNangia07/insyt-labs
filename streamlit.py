@@ -1,251 +1,135 @@
-# streamlit_app.py
-
 import streamlit as st
 import pandas as pd
 from prophet import Prophet
 import matplotlib.pyplot as plt
-import os
 from datetime import timedelta
 import holidays
+from sqlalchemy import create_engine
 
-st.title("Sales Forecast by SKU")
+# Streamlit App Title
+st.title("Sales Forecast by Category")
 
-# Set up folder containing SKU Excel files
-DATA_FOLDER = "data"  # <-- Make sure your Excel files are inside a "data" folder in your working directory
+# Database credentials (you can switch back to st.secrets when deploying)
+DB_USER = "aryan"
+DB_PASSWORD = "shopifyreader123"
+DB_HOST = "p.vrs5dgbq3bf7vhius27jdg6rhu.db.postgresbridge.com"
+DB_PORT = "5432"
+DB_NAME = "Insyt"
 
-# List available SKU files
-sku_files = [f for f in os.listdir(DATA_FOLDER) if f.endswith(".xlsx")]
+# Create SQLAlchemy engine using psycopg2
+engine = create_engine(f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}")
 
-# SKU selector
-selected_sku_file = st.selectbox(
-    "Select SKU to Forecast",
-    sku_files,
-    format_func=lambda x: x.replace('.xlsx', '')
-)
-sku_path = os.path.join(DATA_FOLDER, selected_sku_file)
-
-# Load data
-df = pd.read_excel(sku_path)
-df.columns = df.columns.str.replace(' ', '_').str.lower()
-df['date'] = pd.to_datetime(df['date'], errors='coerce')
-
-# Dictionary of SKUs and their MRP
-sku_mrp = {
-    'FBT': 4499,
-    'Venice': 1495,
-    'Veleno': 1995,
-    'Razor': 149
+# Display Name → Actual SKU mapping
+category_dict = {
+    "Trimmers": {
+        "FBT": "APPLIANCES_FULL_BODY_TRIMMER",
+        "FBT SC": "APPLIANCES_FULL_BODY_TRIMMER_SPL_EDITION",
+        "Power Styler": "APPLIANCES_POWER_STYLER_EDGE_TRIMMER"
+    },
+    "Perfumes": {
+        "Venice": "PERFUME_VENICE_BLUE_30ML",
+        "Veleno": "PERFUME_VELENO_100"
+    }
 }
 
-# Create holiday dataframe
+# Category selection
+selected_category = st.selectbox("Select Product Category", list(category_dict.keys()))
+sku_mapping = category_dict[selected_category]
+
+# Forecast horizon
+months = st.selectbox("Select forecast horizon (months):", options=[1, 2, 3, 4, 5, 6], index=2)
+forecast_days = months * 30
+
+# Warning for longer horizons
+if months > 3:
+    st.warning("Forecasts beyond 3 months may be less accurate due to increased uncertainty.")
+
+# Set cutoff date for training data
+cutoff_date = pd.Timestamp("2025-06-30")
+
+# Define Indian holidays
 ind_holidays = holidays.India(years=[2023, 2024, 2025])
 holiday_df = pd.DataFrame([
-    {'ds': pd.to_datetime(date), 'holiday': 'indian_holiday'}
+    {"ds": pd.to_datetime(date), "holiday": "indian_holiday"}
     for date in ind_holidays.keys()
 ])
 
-# Prepare data for Prophet
-df_copy = df.copy()
-df_copy = df_copy.rename(columns={'date': 'ds', 'sales': 'y'})
+# Forecast results container
+sku_forecasts = {}
 
+# Forecast loop per SKU
+for display_sku, db_sku in sku_mapping.items():
+    try:
+        query = """
+        SELECT orderdate, sku, quantity 
+        FROM shopify.operationalpnl
+        WHERE sku = %s;
+        """
+        df = pd.read_sql(query, con=engine, params=(db_sku,))
 
-# Forecast UI
-months = st.selectbox("Select forecast horizon (months):", options=[1, 2, 3], index=0)
-monthly_marketing = st.slider("Monthly Marketing Spend", min_value=0, max_value=10000000, value=100000, step=100000)
-selling_price = st.slider("Selling Price (SP)", min_value=0, max_value=4499, value=3499, step=50)
+        if df.empty:
+            st.warning(f"No data found for {display_sku}. Skipping.")
+            continue
 
-# Calculate regressors
-forecast_days = months * 30
-daily_marketing = monthly_marketing / 30
+        # Clean and format
+        df = df.dropna(subset=["orderdate", "quantity"])
+        df["orderdate"] = pd.to_datetime(df["orderdate"], errors="coerce")
 
-# Get the MRP for the selected SKU
-selected_sku = selected_sku_file.replace('.xlsx', '')
-selected_mrp = sku_mrp[selected_sku]
+        # ✅ Group by day and sum quantity sold
+        daily_sales = (
+            df.groupby("orderdate")["quantity"]
+            .sum()
+            .reset_index()
+            .rename(columns={"orderdate": "ds", "quantity": "y"})
+        )
 
-# Calculate discount based on selected SKU
-discount = selected_mrp - selling_price
+        # Train cutoff
+        df_train = daily_sales[daily_sales["ds"] <= cutoff_date].copy()
 
-# Filter and clean training data
-cutoff_date = pd.Timestamp('2025-06-30')
-df_copy['discount'].fillna(0, inplace=True)
-df_copy['marketing'].fillna(0, inplace=True)
-df_train = df_copy[df_copy['ds'] <= cutoff_date].copy()
+        if df_train.empty:
+            st.warning(f"Not enough historical data for {display_sku}. Skipping.")
+            continue
 
-# Initialize Prophet model with holidays
-model = Prophet(
-    growth='linear',
-    daily_seasonality=True,
-    weekly_seasonality=True,
-    changepoint_prior_scale=0.3,
-    holidays=holiday_df
-)
+        # Build Prophet model
+        model = Prophet(
+            growth="linear",
+            daily_seasonality=True,
+            weekly_seasonality=True,
+            changepoint_prior_scale=0.3,
+            holidays=holiday_df
+        )
+        model.add_seasonality(name="monthly", period=30.5, fourier_order=5)
+        model.fit(df_train)
 
-model.add_seasonality(
-    name='monthly',
-    period=30.5,
-    fourier_order=5
-)
+        # Forecast future
+        future = model.make_future_dataframe(periods=forecast_days)
+        forecast = model.predict(future)
+        forecast[["yhat", "yhat_lower", "yhat_upper"]] = forecast[["yhat", "yhat_lower", "yhat_upper"]].clip(lower=0)
 
-model.add_regressor('discount')
-model.add_regressor('marketing')
+        # Extract only future months
+        forecast_pred = forecast[forecast["ds"] > cutoff_date].copy()
+        forecast_pred["month"] = forecast_pred["ds"].dt.to_period("M")
+        monthly_sum = forecast_pred.groupby("month")["yhat"].sum().reset_index()
+        monthly_sum.columns = ["Month", display_sku]
+        sku_forecasts[display_sku] = monthly_sum
 
-# Fit model
-model.fit(df_train)
+    except Exception as e:
+        st.error(f"Error processing SKU {display_sku}: {e}")
+        continue
 
-# Build future dataframe
-future = model.make_future_dataframe(periods=forecast_days)
+# Merge forecast results
+summary_df = pd.DataFrame()
+for sku, df_sku in sku_forecasts.items():
+    if summary_df.empty:
+        summary_df = df_sku
+    else:
+        summary_df = pd.merge(summary_df, df_sku, on="Month", how="outer")
 
-# Merge known historical regressors
-future = future.merge(df_copy[['ds', 'discount', 'marketing']], on='ds', how='left')
-
-# Fill in user-defined future values for forecast period
-future.loc[future['ds'] > cutoff_date, 'discount'] = discount
-future.loc[future['ds'] > cutoff_date, 'marketing'] = daily_marketing
-
-# Fill any remaining NaNs (safety)
-future['discount'] = future['discount'].fillna(0)
-future['marketing'] = future['marketing'].fillna(0)
-
-# Forecast
-forecast = model.predict(future)
-
-# Plot
-st.write("### Forecast Plot")
-# fig1 = model.plot(forecast)
-# st.pyplot(fig1)
-
-# Create Plotly figure
-import plotly.graph_objects as go
-
-# Define cutoff date
-cutoff_date = pd.Timestamp("2025-06-30")
-
-# Split forecast data
-forecast_hist = forecast[forecast['ds'] <= cutoff_date]
-forecast_future = forecast[forecast['ds'] > cutoff_date]
-
-# Create Plotly figure
-fig = go.Figure()
-
-# Historical line (black, no markers)
-fig.add_trace(go.Scatter(
-    x=forecast_hist['ds'],
-    y=forecast_hist['yhat'],
-    mode='lines',
-    name='Fitted Sales',
-    line=dict(color='black')
-))
-
-# Forecast line (blue, no markers)
-fig.add_trace(go.Scatter(
-    x=forecast_future['ds'],
-    y=forecast_future['yhat'],
-    mode='lines',
-    name='Forecasted Sales',
-    line=dict(color='blue')
-))
-
-# Confidence interval (forecast only)
-fig.add_trace(go.Scatter(
-    x=forecast_future['ds'],
-    y=forecast_future['yhat_upper'],
-    mode='lines',
-    line=dict(width=0),
-    showlegend=False
-))
-
-fig.add_trace(go.Scatter(
-    x=forecast_future['ds'],
-    y=forecast_future['yhat_lower'],
-    fill='tonexty',
-    fillcolor='rgba(0, 0, 255, 0.2)',
-    line=dict(width=0),
-    name='Confidence Interval'
-))
-
-# Layout
-fig.update_layout(
-    title="Sales Forecast (Historical vs Forecast)",
-    xaxis_title="Date",
-    yaxis_title="Sales",
-    hovermode="x unified"
-)
-
-# Show in Streamlit
-st.plotly_chart(fig, use_container_width=True)
-
-# TRIAL
-
-st.write("### Forecast Plot (Custom)")
-
-fig, ax = plt.subplots(figsize=(10, 6))
-
-# Plot actuals (if any in training set)
-df_plot = df_train[df_train['ds'] <= cutoff_date]
-ax.plot(df_plot['ds'], df_plot['y'], label="Historical Sales", color='black')
-
-# Plot forecast
-ax.plot(forecast['ds'], forecast['yhat'], label="Forecast", color='red')
-ax.fill_between(forecast['ds'], forecast['yhat_lower'], forecast['yhat_upper'],
-                color='pink', alpha=0.3, label='Confidence Interval')
-
-# Formatting
-ax.axvline(cutoff_date, color='gray', linestyle='--', label='Forecast Start')
-ax.set_title("Sales Forecast")
-ax.set_xlabel("Date")
-ax.set_ylabel("Sales")
-ax.legend()
-ax.grid(True)
-
-st.pyplot(fig)
-
-# TRIAL
-
-st.markdown("---")
-
-# TABLE SECTION
-
-# Filter forecast for prediction months only (i.e., after cutoff_date)
-forecast_pred = forecast[forecast['ds'] > cutoff_date].copy()
-
-# Extract month
-forecast_pred['month'] = forecast_pred['ds'].dt.to_period('M')
-
-# Group and summarize
-monthly_summary = forecast_pred.groupby('month').agg({
-    'yhat': 'sum',
-    'yhat_lower': 'sum',
-    'yhat_upper': 'sum'
-}).reset_index()
-
-# Rename columns
-monthly_summary.columns = ['Month', 'Predicted Sales', 'Lower End', 'Higher End']
-
-# Round for display
-monthly_summary[['Predicted Sales', 'Lower End', 'Higher End']] = monthly_summary[[
-    'Predicted Sales', 'Lower End', 'Higher End']].round(0)
-
-# Convert month back to string for nicer display
-monthly_summary['Month'] = monthly_summary['Month'].astype(str)
-
-# Display in Streamlit
-st.write("### Monthly Forecast Summary")
-st.dataframe(monthly_summary)
-
-st.markdown("---")
-
-# Filter forecast for prediction period only (after cutoff_date)
-forecast_pred = forecast[forecast['ds'] > cutoff_date].copy()
-
-# Select and rename relevant columns
-daily_summary = forecast_pred[['ds', 'yhat', 'yhat_lower', 'yhat_upper']].copy()
-daily_summary.columns = ['Date', 'Predicted Sales', 'Lower End', 'Higher End']
-
-# Round values for readability
-daily_summary[['Predicted Sales', 'Lower End', 'Higher End']] = daily_summary[[
-    'Predicted Sales', 'Lower End', 'Higher End']].round(0)
-
-# Display in Streamlit
-st.write("### Daily Forecast Details")
-daily_summary['Date'] = pd.to_datetime(daily_summary['Date']).dt.date
-st.dataframe(daily_summary)
+# Display results
+if not summary_df.empty:
+    summary_df = summary_df.fillna(0)
+    summary_df["Month"] = summary_df["Month"].astype(str)
+    st.write("### Forecast Summary by SKU (Monthly)")
+    st.dataframe(summary_df.set_index("Month").round(0))
+else:
+    st.info("No forecasts to display.")
