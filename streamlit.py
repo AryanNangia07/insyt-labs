@@ -45,7 +45,33 @@ if months > 3:
     st.warning("Forecasts beyond 3 months may be less accurate due to increased uncertainty.")
 
 # Set cutoff date for training data
-cutoff_date = pd.Timestamp("2025-06-30")
+from datetime import datetime
+
+# Get maximum date in your data (or fallback to today)
+max_available_date = pd.to_datetime("today").normalize()
+
+cutoff_options = {
+    "Today": 0,
+    "1 day ago": 1,
+    "7 days ago": 7,
+    "14 days ago": 14,
+    "30 days ago": 30,
+    "60 days ago": 60,
+    "90 days ago": 90
+}
+
+cutoff_label = st.select_slider(
+    "Select cutoff date for forecast:",
+    options=list(cutoff_options.keys()),
+    value="7 days ago"
+)
+
+cutoff_date = max_available_date - timedelta(days=cutoff_options[cutoff_label])
+test_start_date = cutoff_date - timedelta(days=90)
+
+st.caption(f"🔍 Forecasts are generated from data up to **{cutoff_date.date()}**. "
+           f"Backtest checks accuracy from **{test_start_date.date()} to {cutoff_date.date()}**.")
+
 
 # Define Indian holidays
 ind_holidays = holidays.India(years=[2023, 2024, 2025])
@@ -84,11 +110,41 @@ for display_sku, db_sku in sku_mapping.items():
         )
 
         # Train cutoff
+                # Train cutoff
         df_train = daily_sales[daily_sales["ds"] <= cutoff_date].copy()
+
+        # Backtest setup: last 90 days before cutoff
+        df_test = daily_sales[
+            (daily_sales["ds"] > test_start_date) & (daily_sales["ds"] <= cutoff_date)
+        ].copy()
+
+        mape = None  # default value
+
+        if not df_test.empty and len(df_test) >= 30:
+            backtest_model = Prophet(
+                growth="linear",
+                daily_seasonality=True,
+                weekly_seasonality=True,
+                changepoint_prior_scale=0.3,
+                holidays=holiday_df
+            )
+            backtest_model.add_seasonality(name="monthly", period=30.5, fourier_order=5)
+            backtest_model.fit(daily_sales[daily_sales["ds"] < test_start_date])
+
+            days_to_forecast = (cutoff_date - test_start_date).days
+            backtest_future = backtest_model.make_future_dataframe(periods=days_to_forecast)
+            backtest_forecast = backtest_model.predict(backtest_future)
+            backtest_forecast = backtest_forecast[["ds", "yhat"]].clip(lower=0)
+
+            merged_bt = pd.merge(df_test, backtest_forecast, on="ds", how="left")
+            merged_bt["error"] = abs(merged_bt["y"] - merged_bt["yhat"])
+            merged_bt["pct_error"] = merged_bt["error"] / merged_bt["y"] * 100
+            mape = merged_bt["pct_error"].mean()
 
         if df_train.empty:
             st.warning(f"Not enough historical data for {display_sku}. Skipping.")
             continue
+
 
         # Build Prophet model
         model = Prophet(
@@ -126,10 +182,14 @@ for sku, df_sku in sku_forecasts.items():
         summary_df = pd.merge(summary_df, df_sku, on="Month", how="outer")
 
 # Display results
+# Display results
 if not summary_df.empty:
     summary_df = summary_df.fillna(0)
     summary_df["Month"] = summary_df["Month"].astype(str)
     st.write("### Forecast Summary by SKU (Monthly)")
     st.dataframe(summary_df.set_index("Month").round(0))
+
+    if mape is not None:
+        st.caption(f"📉 **Model Accuracy (MAPE)** over last 90 days before cutoff: **{mape:.2f}%**")
 else:
     st.info("No forecasts to display.")
