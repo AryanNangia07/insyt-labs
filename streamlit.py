@@ -10,11 +10,11 @@ from sqlalchemy import create_engine
 st.title("Sales Forecast by Category")
 
 # Database credentials (you can switch back to st.secrets when deploying)
-DB_USER = "aryan"
-DB_PASSWORD = "shopifyreader123"
-DB_HOST = "p.vrs5dgbq3bf7vhius27jdg6rhu.db.postgresbridge.com"
-DB_PORT = "5432"
-DB_NAME = "Insyt"
+DB_USER = st.secrets["DB_USER"]
+DB_PASSWORD = st.secrets["DB_PASSWORD"]
+DB_HOST = st.secrets["DB_HOST"]
+DB_PORT = st.secrets["DB_PORT"]
+DB_NAME = st.secrets["DB_NAME"]
 
 # Create SQLAlchemy engine using psycopg2
 engine = create_engine(f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}")
