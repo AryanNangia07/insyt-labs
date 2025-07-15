@@ -100,6 +100,10 @@ for display_sku, db_sku in sku_mapping.items():
         # Clean and format
         df = df.dropna(subset=["orderdate", "quantity"])
         df["orderdate"] = pd.to_datetime(df["orderdate"], errors="coerce")
+         
+         # ✅ Convert cutoff and test dates to datetime
+        cutoff_date = pd.to_datetime(cutoff_date)
+        test_start_date = pd.to_datetime(test_start_date)
 
         # ✅ Group by day and sum quantity sold
         daily_sales = (
