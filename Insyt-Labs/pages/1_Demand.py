@@ -10,7 +10,7 @@ import plotly.graph_objects as go
 
 
 # —––––– Streamlit App Title –––––—
-st.title("Sales Forecast v3.0")
+st.title("Demand Forecast v3.0")
 
 # —––––– Database credentials –––––—
 DB_USER = st.secrets["DB_USER"]
