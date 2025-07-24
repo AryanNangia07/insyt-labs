@@ -4,11 +4,11 @@ import numpy as np
 from prophet import Prophet
 from datetime import timedelta
 import holidays
-from sqlalchemy import create_engine
-from sqlalchemy.sql import text
+from sqlalchemy import create_engine, text
 import traceback
 import plotly.graph_objects as go
-
+from pandas.tseries.offsets import MonthBegin
+import io
 
 # —––––– Streamlit App Title –––––—
 st.title("Demand Forecast v3.0")
@@ -20,7 +20,6 @@ DB_HOST = st.secrets["DB_HOST"]
 DB_PORT = st.secrets["DB_PORT"]
 DB_NAME = st.secrets["DB_NAME"]
 
-# Create engine
 engine = create_engine(
     f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 )
@@ -28,189 +27,205 @@ engine = create_engine(
 # —––––– Category selection —––––—
 category = st.selectbox(
     "Select Product Category:",
-    options=["Bombae", "Fragrances", "Trimmers", "Shaving"],
-    index=0
+    options=["Skin", "Bombae", "Fragrances", "Trimmers", "Shaving"]
 )
+cat_filter_map = {
+    "Bombae": "sku LIKE 'BAE%'",
+    "Fragrances": "(sku LIKE 'PERFUME%' OR sku LIKE 'DEODRANT%')",
+    "Trimmers": "sku LIKE 'APPLIANCES%'",
+    "Shaving": "sku LIKE 'SHAVE%'",
+    "Skin": "sku LIKE 'SKIN%'"
+}
+cat_filter = cat_filter_map.get(category, "1=1")
 
-# Build category filter
-if category == "Bombae":
-    cat_filter = "sku LIKE 'BAE%'"
-elif category == "Fragrances":
-    cat_filter = "(sku LIKE 'PERFUME%' OR sku LIKE 'DEODRANT%')"
-elif category == "Trimmers":
-    cat_filter = "sku LIKE 'APPLIANCES%'"
-elif category == "Shaving":
-    cat_filter = "sku LIKE 'SHAVE%'"
-
-# —––––– Fetch dynamic SKU list (active in last 14 days) —––––—
-two_weeks_ago = (pd.Timestamp('today').normalize() - pd.Timedelta(days=14)).date()
+# —––––– Dynamic SKU filtering —––––—
+today = pd.Timestamp('today').normalize()
+two_weeks_ago = today - timedelta(days=14)
 sku_query = f"""
     SELECT DISTINCT sku
     FROM shopify.operationalpnl
     WHERE {cat_filter}
-      AND orderdate >= '{two_weeks_ago}'
+      AND orderdate >= '{two_weeks_ago.date()}'
       AND quantity > 0
-    ORDER BY sku
 """
 sku_df = pd.read_sql_query(text(sku_query), con=engine)
-sku_list = sku_df['sku'].tolist()
-
+skus = sku_df['sku'].tolist()
+def_month = today.replace(day=1)
+three_months_ago = def_month - pd.DateOffset(months=3)
+filter_query = f"""
+    SELECT sku, DATE_TRUNC('month', orderdate)::date AS m, SUM(quantity) AS qty
+    FROM shopify.operationalpnl
+    WHERE {cat_filter}
+      AND orderdate >= '{three_months_ago.date()}'
+    GROUP BY sku, m
+"""
+mon = pd.read_sql_query(text(filter_query), con=engine)
+piv = mon.pivot(index='sku', columns='m', values='qty').fillna(0)
+last3 = sorted(piv.columns)[-3:]
+available_skus = [s for s in piv.index if (piv.loc[s, last3] >= 30).all()]
 selected_skus = st.multiselect(
-    "Select SKUs to Forecast:",
-    options=sku_list,
-    default=[]
+    "Select SKUs to Forecast:", options=[s for s in skus if s in available_skus]
 )
 if not selected_skus:
     st.error("Please select at least one SKU.")
     st.stop()
-# Build SKU filter clause
-sku_filter = "sku IN (" + ",".join(f"'{s}'" for s in selected_skus) + ")"
 
-# —––––– Forecast horizon & cutoff —––––—
+# —––––– Forecast horizon —––––—
 months = st.selectbox("Forecast horizon (months)", [1,2,3,4,5,6], index=2)
-forecast_days = months * 30
+forecast_months = months
 if months > 3:
     st.warning("Forecasts beyond 3 months may be less accurate.")
 
-max_date = pd.to_datetime('today').normalize()
-cutoff_opts = {"Today":0, "7 days ago":7, "14 days ago":14, "30 days ago":30}
-cutoff_label = st.select_slider("Select cutoff date:", options=list(cutoff_opts.keys()), value="7 days ago")
-cutoff_date = max_date - timedelta(days=cutoff_opts[cutoff_label])
-test_start = cutoff_date - timedelta(days=90)
-st.caption(f"Data up to {cutoff_date.date()}, backtest {test_start.date()} to {cutoff_date.date()}")
-
-# —––––– Projected avg price per SKU —––––—
+# —––––– Regressor inputs —––––—
 projected_prices = {}
 with st.expander("Set projected avg selling price per SKU", expanded=False):
     for sku in selected_skus:
-        q = """
-            SELECT SUM(grosssales) AS total_gross, SUM(quantity) AS total_qty
-            FROM shopify.operationalpnl
-            WHERE sku = %s
-              AND orderdate BETWEEN %s AND %s;
-        """
-        r = pd.read_sql(q, con=engine, params=(sku, cutoff_date - timedelta(days=7), cutoff_date))
-        default = 0.0
-        if not r.empty and pd.notnull(r.iloc[0]['total_qty']) and r.iloc[0]['total_qty'] > 0:
-            default = r.iloc[0]['total_gross'] / r.iloc[0]['total_qty']
+        q = text(
+            "SELECT COALESCE(SUM(grosssales),0) AS total_gross, COALESCE(SUM(quantity),0) AS total_qty"
+            " FROM shopify.operationalpnl"
+            " WHERE sku=:sku AND orderdate BETWEEN :start AND :end"
+        )
+        r = pd.read_sql_query(
+            q, con=engine,
+            params={"sku":sku, "start":today-timedelta(days=7), "end":today}
+        )
+        default = (r.at[0,'total_gross']/r.at[0,'total_qty']) if r.at[0,'total_qty']>0 else 0.0
         projected_prices[sku] = st.number_input(
             f"Avg Price for {sku}", min_value=0.0, max_value=10000.0,
-            value=round(default,2), step=1.0, key=f"price_{sku}" )
+            value=round(default,2), step=1.0, key=f"price_{sku}"
+        )
 
-# —––––– Monthly marketing spend split —––––—
-monthly_spend = st.slider("Projected Monthly Marketing Spend (Category)", 0, 100_000_00, 0, 10_000)
-first_this = cutoff_date.replace(day=1)
-last_end = first_this - timedelta(days=1)
+# —––––– Marketing spend slider —––––—
+first = today.replace(day=1)
+last_end = first - timedelta(days=1)
 last_start = last_end.replace(day=1)
+csq = text(
+    f"SELECT COALESCE(SUM(totalmarketingspend),0) AS spend"
+    f" FROM shopify.operationalpnl WHERE {cat_filter}"
+    f" AND orderdate BETWEEN :start AND :end"
+)
+cat_spend = pd.read_sql_query(csq, con=engine, params={"start":last_start, "end":last_end}).at[0,'spend']
+monthly_spend = st.slider(
+    "Projected monthly marketing spend (Category)", 0, 500_000_00, int(cat_spend), step=10000
+)
 sp_totals = {}
 for sku in selected_skus:
-    q = """
-        SELECT SUM(totalmarketingspend) AS spend
-        FROM shopify.operationalpnl
-        WHERE sku = %s
-          AND orderdate BETWEEN %s AND %s;
-    """
-    r = pd.read_sql(q, con=engine, params=(sku, last_start, last_end))
-    sp_totals[sku] = r.iloc[0]['spend'] or 0
-# Compute ratios & daily spend
-total_sp = sum(sp_totals.values()) or 1
-daily_mark = {sku: (monthly_spend * (sp_totals[sku]/total_sp))/30 for sku in selected_skus}
+    sq = text(
+        "SELECT COALESCE(SUM(totalmarketingspend),0) AS spend"
+        " FROM shopify.operationalpnl WHERE sku=:sku AND orderdate BETWEEN :start AND :end"
+    )
+    r = pd.read_sql_query(sq, con=engine, params={"sku":sku, "start":last_start, "end":last_end})
+    sp_totals[sku] = r.at[0,'spend']
+sum_sp = cat_spend or 1
+daily_mark = {sku: (monthly_spend * (sp_totals[sku]/sum_sp)) / 30 for sku in selected_skus}
 
 # —––––– Holidays —––––—
-hol_df = pd.DataFrame([{"ds": pd.to_datetime(d), "holiday":"indian"}
-                       for d in holidays.India(years=[2023,2024,2025]).keys()])
+hol_df = pd.DataFrame([
+    {"ds":pd.to_datetime(d),"holiday":"indian_holiday"}
+    for d in holidays.India(years=[2023,2024,2025]).keys()
+])
 
-# —––––– Forecast loop —––––—
-sku_forecasts, error_pct = {}, {}
+# —––––– Forecast & Backtest —––––—
+sku_forecasts = {}
+sku_daily_forecasts = {}
+error_pct = {}
 for sku in selected_skus:
-    df = pd.read_sql_query(text(
-        "SELECT orderdate, quantity AS y, grosssales, totalmarketingspend"
-        " FROM shopify.operationalpnl WHERE sku = :sku"),
-        con=engine, params={"sku": sku}
+    df = pd.read_sql_query(
+        text("SELECT orderdate, quantity AS y, grosssales, totalmarketingspend FROM shopify.operationalpnl WHERE sku=:sku"),
+        con=engine, params={"sku":sku}
     )
     if df.empty:
-        st.warning(f"No data for {sku}. Skipping.")
         continue
     df['orderdate'] = pd.to_datetime(df['orderdate'])
-    ds = df.groupby('orderdate').agg({'y':'sum','grosssales':'sum','totalmarketingspend':'sum'})
-    ds = ds.reset_index().rename(columns={'orderdate':'ds','totalmarketingspend':'marketing_spend'})
+    ds = df.groupby('orderdate').agg({'y':'sum','grosssales':'sum','totalmarketingspend':'sum'}).reset_index()
+    ds.rename(columns={'orderdate':'ds','totalmarketingspend':'marketing_spend'}, inplace=True)
     ds['discount'] = ds['grosssales']/ds['y']
-    ds.replace([np.inf,-np.inf],np.nan,inplace=True)
+    ds.replace([np.inf,-np.inf],np.nan, inplace=True);
     ds.dropna(subset=['discount'], inplace=True)
 
-    train = ds[ds['ds'] <= cutoff_date]
-    test = ds[(ds['ds'] > test_start) & (ds['ds'] <= cutoff_date)]
-    if train.empty:
-        st.warning(f"Not enough history for {sku}. Skipping.")
-        continue
-
     # Backtest
-    bt = Prophet(daily_seasonality=True, weekly_seasonality=True, holidays=hol_df)
-    bt.add_seasonality('monthly',30.5,5)
-    bt.add_regressor('marketing_spend')
-    bt.add_regressor('discount')
-    bt.fit(train[train['ds'] < test_start][['ds','y','marketing_spend','discount']])
-    days_bt = (cutoff_date-test_start).days
-    fut_bt = bt.make_future_dataframe(periods=days_bt)
+    test_start = today - pd.DateOffset(months=3)
+    train = ds[ds['ds'] < today]
+    bt = Prophet(daily_seasonality=True, weekly_seasonality=True, holidays=hol_df, interval_width=0.8)
+    bt.add_seasonality('monthly',30.5,5); bt.add_regressor('marketing_spend'); bt.add_regressor('discount')
+    bt.fit(train[train['ds']<test_start][['ds','y','marketing_spend','discount']])
+    fut_bt = bt.make_future_dataframe(periods=(today-test_start).days)
     fut_bt = fut_bt.merge(ds[['ds','marketing_spend','discount']], on='ds', how='left')
     fut_bt['marketing_spend'].fillna(daily_mark[sku], inplace=True)
     fut_bt['discount'].fillna(projected_prices[sku], inplace=True)
     pbt = bt.predict(fut_bt)[['ds','yhat']]
     pbt['yhat'] = pbt['yhat'].clip(lower=0)
-    slice_bt = pbt[(pbt['ds']>test_start)&(pbt['ds']<=cutoff_date)]
-    error_pct[sku] = ((slice_bt['yhat'].sum() - test['y'].sum())/test['y'].sum()*100
-                      if test['y'].sum()>0 else None)
+    slice_bt = pbt[(pbt['ds']>test_start)&(pbt['ds']<=today)]
+    actual_bt = ds[(ds['ds']>test_start)&(ds['ds']<=today)]['y'].sum()
+    error_pct[sku] = ((slice_bt['yhat'].sum()-actual_bt)/actual_bt*100) if actual_bt>0 else None
 
-    # Final forecast
-    m = Prophet(daily_seasonality=True, weekly_seasonality=True, holidays=hol_df)
-    m.add_seasonality('monthly',30.5,5)
-    m.add_regressor('marketing_spend')
-    m.add_regressor('discount')
+    # Forecast daily
+    m = Prophet(daily_seasonality=True, weekly_seasonality=True, holidays=hol_df, interval_width=0.95)
+    m.add_seasonality('monthly',30.5,5); m.add_regressor('marketing_spend'); m.add_regressor('discount')
     m.fit(train[['ds','y','marketing_spend','discount']])
-    fut = m.make_future_dataframe(periods=forecast_days)
-    fut = fut.merge(ds[['ds','marketing_spend','discount']], on='ds', how='left')
+    start_next = today.replace(day=1) + MonthBegin(1)
+    m_dates = pd.date_range(start=start_next, periods=forecast_months, freq='MS')
+    future_dates = []
+    for d in m_dates:
+        end = d + MonthBegin(1) - timedelta(days=1)
+        future_dates.extend(pd.date_range(d, end))
+    fut = pd.DataFrame({'ds':future_dates}).merge(ds[['ds','marketing_spend','discount']], on='ds', how='left')
     fut['marketing_spend'].fillna(daily_mark[sku], inplace=True)
     fut['discount'].fillna(projected_prices[sku], inplace=True)
     fc = m.predict(fut)
-    fc[['yhat','yhat_lower','yhat_upper']] = fc[['yhat','yhat_lower','yhat_upper']].clip(lower=0)
-    merged = pd.merge(ds[['ds','y']].rename(columns={'y':'Actual'}),
-                      fc[['ds','yhat']].rename(columns={'yhat':'Forecast'}),
-                      on='ds', how='outer').sort_values('ds')
-    sku_forecasts[sku] = merged
+    fc['yhat'] = fc['yhat'].clip(lower=0)
+    sku_daily_forecasts[sku] = fc[['ds']].assign(Forecast=fc['yhat'])
 
-# —––––– Display & graph —––––—
+    # monthly summary
+    fc['Month'] = fc['ds'].dt.to_period('M')
+    sku_forecasts[sku] = fc.groupby('Month')['yhat'].sum().reset_index().rename(columns={'yhat':'Forecast'})
+
+# —––––– Display —––––—
 if sku_forecasts:
-    summary_df = None
-    for sku, df_sku in sku_forecasts.items():
-        mon = (df_sku[df_sku['ds']>cutoff_date]
-               .groupby(df_sku['ds'].dt.to_period('M'))['Forecast']
-               .sum().reset_index())
-        mon.columns = ['Month', sku]
-        summary_df = mon if summary_df is None else summary_df.merge(mon, on='Month', how='outer')
-    summary_df.fillna(0, inplace=True)
-    summary_df['Month'] = summary_df['Month'].astype(str)
+    # Monthly table
+    df_cat = pd.concat({k:v.set_index('Month')['Forecast'] for k,v in sku_forecasts.items()}, axis=1)
+    st.markdown('### Monthly Forecast')
+    st.dataframe(df_cat.fillna(0).astype(int))
 
-    st.write('### Forecast Summary by SKU (Monthly)')
-    st.dataframe(summary_df.set_index('Month').round(0))
-    st.write('### 3‑Month Backtest Error % by SKU')
-    for sku, err in error_pct.items():
-        st.caption(f"{sku}: {err:.2f}%" if err is not None else f"{sku}: no data")
+    # Backtest Accuracy expander
+    with st.expander('📈 Backtest Accuracy (3mo)'):
+        for sku, err in error_pct.items():
+            st.caption(f"{sku}: {err:.2f}%" if err is not None else f"{sku}: No data")
 
-    with st.expander('📊 View Forecast Graphs', expanded=False):
-        graph_skus = st.multiselect('Choose SKU(s):', list(sku_forecasts.keys()), default=list(sku_forecasts.keys()))
-        c1, c2, c3 = st.columns([1,2,1])
-        with c2:
-            if st.button('Create Graph'):
-                fig = go.Figure()
-                for sku in graph_skus:
-                    dfp = sku_forecasts[sku]
-                    fig.add_trace(go.Scatter(x=dfp['ds'], y=dfp['Actual'], mode='lines', name=f'{sku} - Actual'))
-                    fig.add_trace(go.Scatter(x=dfp['ds'], y=dfp['Forecast'], mode='lines', name=f'{sku} - Forecast', line=dict(dash='dot')))
-                fig.update_layout(
-                    title='Actual vs Forecasted Daily Sales by SKU',
-                    xaxis_title='Date', yaxis_title='Daily Sales',
-                    hovermode='x unified', template='plotly_white'
+    # Daily graphs expander
+    with st.expander('📊 Daily Actual vs Forecast'):
+        daily_choice = st.multiselect(
+            'Select SKUs for Daily plot', selected_skus,
+            default=selected_skus, key='daily_skus')
+        if st.button('Create Daily Graph', key='daily_button'):
+            fig = go.Figure()
+            for sku in daily_choice:
+                # Fetch daily actuals for this SKU
+                hist_q = text(
+                    "SELECT orderdate, SUM(quantity) AS y "
+                    "FROM shopify.operationalpnl WHERE sku=:sku "
+                    "GROUP BY orderdate ORDER BY orderdate"
                 )
-                st.plotly_chart(fig, use_container_width=True)
+                df_hist = pd.read_sql_query(
+                    hist_q, con=engine, params={"sku": sku}
+                )
+                df_hist['orderdate'] = pd.to_datetime(df_hist['orderdate'])
+                fig.add_trace(go.Scatter(
+                    x=df_hist['orderdate'], y=df_hist['y'], mode='lines',
+                    name=f'{sku} Actual'
+                ))
+                # Forecast daily
+                df_fc = sku_daily_forecasts.get(sku)
+                if df_fc is not None:
+                    fig.add_trace(go.Scatter(
+                        x=df_fc['ds'], y=df_fc['Forecast'], mode='lines',
+                        name=f'{sku} Forecast', line=dict(dash='dot')
+                    ))
+            fig.update_layout(
+                title='Daily Actual vs Forecast', xaxis_title='Date', yaxis_title='Units',
+                template='plotly_white', legend=dict(orientation='h', y=-0.2, x=0.5, xanchor='center')
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
 else:
-    st.info('No forecasts to display.')
+    st.info('No forecast data available.')
